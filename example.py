@@ -1,10 +1,21 @@
 import os
+from enum import Enum
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
 
+class Model(Enum):
+    OURO = "~/huggingface/Ouro-1.4B/"
+    QWEN3_8B = "~/huggingface/Qwen3-8B/"
+    QWEN3_0_6B = "~/huggingface/Qwen3-0.6B/"
+
+    @property
+    def path(self) -> str:
+        return os.path.expanduser(self.value)
+
+
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = Model.QWEN3_8B.path
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
@@ -12,7 +23,7 @@ def main():
     prompts = [
         "introduce yourself",
         "list all prime numbers within 100",
-    ] * 100
+    ] * 64
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
