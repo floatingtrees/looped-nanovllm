@@ -2,8 +2,19 @@ import os
 import time
 from random import randint, seed
 from nanovllm import LLM, SamplingParams
+from enum import Enum
+
 # from vllm import LLM, SamplingParams
 
+
+class Model(Enum):
+    OURO = "~/huggingface/Ouro-1.4B/"
+    QWEN3_8B = "~/huggingface/Qwen3-8B/"
+    QWEN3_0_6B = "~/huggingface/Qwen3-0.6B/"
+
+    @property
+    def path(self) -> str:
+        return os.path.expanduser(self.value)
 
 def main():
     seed(0)
@@ -11,7 +22,7 @@ def main():
     max_input_len = 1024
     max_ouput_len = 1024
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.path.expanduser(Model.OURO.path)
     llm = LLM(path, enforce_eager=False, max_model_len=4096)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
