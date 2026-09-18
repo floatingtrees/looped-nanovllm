@@ -9,6 +9,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.utils.context import set_depth
 
 
 class Qwen3Attention(nn.Module):
@@ -210,6 +211,31 @@ class Qwen3ForCausalLM(nn.Module):
         return self.model(input_ids, positions)
 
     def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.lm_head(hidden_states)
+
+    def prelude(
+        self,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
+    def recurrence(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        depth: torch.Tensor,
+    ) -> tuple[torch.Tensor, None]:
+        set_depth(depth)
+        residual = None
+        for layer in self.model.layers:
+            hidden_states, residual = layer(positions, hidden_states, residual)
+        hidden_states, _ = self.model.norm(hidden_states, residual)
+        return hidden_states, None
+
+    def coda(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:

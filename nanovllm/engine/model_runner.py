@@ -39,7 +39,9 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = MODEL_REGISTRY[hf_config.architectures[0]](hf_config)
         load_model(self.model, config.model)
+        self.num_loops = getattr(hf_config, "total_ut_steps", 1)
         self.kv_cache = None    # allocated after warmup has measured peak activation memory
+        self.depth_buffer = torch.zeros(max(config.max_num_batched_tokens, config.max_num_seqs), dtype=torch.int64)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -107,7 +109,12 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        depth = self.run_prelude(seqs, True)
+        for _ in range(self.num_loops):
+            gate_logits = self.run_recurrence(depth)
+            depth += 1
+        self.run_coda()
+        self.has_gate = gate_logits is not None
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -122,7 +129,7 @@ class ModelRunner:
         attention_layers = [module for module in self.model.modules() if isinstance(module, Attention)]
         for layer_id, module in enumerate(attention_layers):
             module.layer_id = layer_id
-        num_depths = getattr(hf_config, "total_ut_steps", 1)
+        num_depths = self.num_loops
         block_bytes = 2 * len(attention_layers) * num_depths * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
@@ -201,29 +208,49 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
-
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run_prelude(self, seqs: list[Sequence], is_prefill: bool) -> torch.Tensor:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        self.temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        self.positions = positions
+        self.num_rows = num_rows = input_ids.size(0)
+        self.graph = None
+        if not (is_prefill or self.enforce_eager or num_rows > 512):
+            context = get_context()
+            self.graph = self.graphs[next(x for x in self.graph_bs if x >= num_rows)]
+            graph_vars = self.graph_vars
+            graph_vars["input_ids"][:num_rows] = input_ids
+            graph_vars["positions"][:num_rows] = positions
+            graph_vars["slot_mapping"].fill_(-1)
+            graph_vars["slot_mapping"][:num_rows] = context.slot_mapping
+            graph_vars["context_lens"].zero_()
+            graph_vars["context_lens"][:num_rows] = context.context_lens
+            graph_vars["block_tables"][:num_rows, :context.block_tables.size(1)] = context.block_tables
+            self.graph["prelude"].replay()
+            self.hidden_states = graph_vars["hidden_states"][:num_rows]
+        else:
+            self.hidden_states = self.model.prelude(input_ids)
+        return self.depth_buffer[:num_rows].zero_()
+
+    @torch.inference_mode()
+    def run_recurrence(self, depth: torch.Tensor) -> torch.Tensor | None:
+        if self.graph is not None:
+            captured = self.graph_vars["depth"][:self.num_rows]
+            if depth.data_ptr() != captured.data_ptr():
+                captured.copy_(depth)
+            self.graph["recurrence"].replay()
+            return self.graph_vars["gate_logits"][:self.num_rows] if self.has_gate else None
+        self.hidden_states, gate_logits = self.model.recurrence(self.hidden_states, self.positions, depth)
+        return gate_logits.squeeze(-1) if gate_logits is not None else None
+
+    @torch.inference_mode()
+    def run_coda(self) -> list[int] | None:
+        if self.graph is not None and self.graph["coda"] is not None:
+            self.graph["coda"].replay()
+            logits = self.graph_vars["logits"][:self.num_rows]
+        else:
+            logits = self.model.coda(self.hidden_states)
+        token_ids = self.sampler(logits, self.temperatures).tolist() if self.rank == 0 else None
+        self.hidden_states = self.positions = self.temperatures = self.graph = None
         reset_context()
         return token_ids
 
@@ -238,20 +265,43 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        depth = self.depth_buffer[:max_bs]
+        hidden_states = torch.zeros(max_bs, hf_config.hidden_size)
+        gate_logits = torch.zeros(max_bs)
+        logits = torch.zeros(max_bs, hf_config.vocab_size) if self.world_size == 1 else None
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
-        for bs in reversed(self.graph_bs):
+        def capture(fn):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], kv_cache=self.kv_cache)
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            fn()
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                fn()
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
+            return graph
+
+        for bs in reversed(self.graph_bs):
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], kv_cache=self.kv_cache)
+
+            def prelude():
+                hidden_states[:bs] = self.model.prelude(input_ids[:bs])
+
+            def recurrence():
+                output, gate = self.model.recurrence(hidden_states[:bs], positions[:bs], depth[:bs])
+                hidden_states[:bs] = output
+                if gate is not None:
+                    gate_logits[:bs] = gate.squeeze(-1)
+
+            def coda():
+                logits[:bs] = self.model.coda(hidden_states[:bs])
+
+            self.graphs[bs] = {
+                "prelude": capture(prelude),
+                "recurrence": capture(recurrence),
+                "coda": capture(coda) if logits is not None else None,
+            }
             torch.cuda.synchronize()
             reset_context()
 
@@ -261,5 +311,8 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
-            outputs=outputs,
+            depth=depth,
+            hidden_states=hidden_states,
+            gate_logits=gate_logits,
+            logits=logits,
         )
