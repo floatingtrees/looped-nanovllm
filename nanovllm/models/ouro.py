@@ -204,8 +204,8 @@ class OuroModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([OuroDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # Only needed to hold the checkpoint's weights: every loop step is run, so the
-        # gate that would decide when to exit early is never evaluated.
+        # forward runs every loop step and never evaluates this gate; recurrence()
+        # reports its output per step without acting on it.
         self.early_exit_gate = ReplicatedLinear(config.hidden_size, 1, bias=True)
 
     def forward(
@@ -259,7 +259,7 @@ class OuroForCausalLM(nn.Module):
         return self.lm_head(hidden_states)
 
     # forward and compute_logits, split at the loop boundary:
-    # coda(recurrence(prelude(input_ids), positions)) == compute_logits(forward(input_ids, positions))
+    # coda(recurrence(prelude(input_ids), positions)[0]) == compute_logits(forward(input_ids, positions))
 
     def prelude(
         self,
@@ -271,14 +271,19 @@ class OuroForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        # The final norm runs inside the loop: its output is both the step's readout
-        # and the next step's input, so it belongs here rather than in the coda.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns the final hidden states and the exit gate's logit after every loop
+        step, shaped (num_tokens, total_ut_steps). The gate only reads the hidden
+        states, so the hidden states match forward exactly."""
+        gate_logits = []
         for ut_step in range(self.model.total_ut_steps):
             for layer in self.model.layers:
                 hidden_states = layer(positions, hidden_states, ut_step)
+            # The final norm runs inside the loop: its output is both the step's readout
+            # and the next step's input, so it belongs here rather than in the coda.
             hidden_states = self.model.norm(hidden_states)
-        return hidden_states
+            gate_logits.append(self.model.early_exit_gate(hidden_states))
+        return hidden_states, torch.cat(gate_logits, dim=-1)
 
     def coda(
         self,

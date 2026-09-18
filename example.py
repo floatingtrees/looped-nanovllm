@@ -15,7 +15,7 @@ class Model(Enum):
 
 
 def main():
-    path = Model.QWEN3_8B.path
+    path = Model.OURO.path
     print(path)
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
