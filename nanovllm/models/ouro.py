@@ -257,3 +257,31 @@ class OuroForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    # forward and compute_logits, split at the loop boundary:
+    # coda(recurrence(prelude(input_ids), positions)) == compute_logits(forward(input_ids, positions))
+
+    def prelude(
+        self,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
+    def recurrence(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        # The final norm runs inside the loop: its output is both the step's readout
+        # and the next step's input, so it belongs here rather than in the coda.
+        for ut_step in range(self.model.total_ut_steps):
+            for layer in self.model.layers:
+                hidden_states = layer(positions, hidden_states, ut_step)
+            hidden_states = self.model.norm(hidden_states)
+        return hidden_states
+
+    def coda(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.lm_head(hidden_states)
