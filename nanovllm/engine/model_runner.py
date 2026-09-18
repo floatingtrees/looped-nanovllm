@@ -5,7 +5,9 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
+from nanovllm.engine.kv_cache import KVCache
 from nanovllm.engine.sequence import Sequence
+from nanovllm.layers.attention import Attention
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.ouro import OuroForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -37,6 +39,7 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = MODEL_REGISTRY[hf_config.architectures[0]](hf_config)
         load_model(self.model, config.model)
+        self.kv_cache = None    # allocated after warmup has measured peak activation memory
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -116,16 +119,14 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        attention_layers = [module for module in self.model.modules() if isinstance(module, Attention)]
+        for layer_id, module in enumerate(attention_layers):
+            module.layer_id = layer_id
+        num_depths = getattr(hf_config, "total_ut_steps", 1)
+        block_bytes = 2 * len(attention_layers) * num_depths * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        self.kv_cache = KVCache(len(attention_layers), num_depths, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -173,7 +174,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, self.kv_cache)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -191,7 +192,7 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, kv_cache=self.kv_cache)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -244,7 +245,7 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], kv_cache=self.kv_cache)
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture

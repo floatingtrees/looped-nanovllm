@@ -10,6 +10,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear, ReplicatedLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.utils.context import set_depth
 
 
 class OuroConfig(Qwen3Config):
@@ -52,7 +53,6 @@ class OuroAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        total_ut_steps: int,
         max_position: int = 4096 * 32,
         head_dim: int | None = None,
         rope_theta: float = 10000,
@@ -91,23 +91,19 @@ class OuroAttention(nn.Module):
             max_position=max_position,
             base=rope_theta,
         )
-        # A loop step re-attends with the same weights but different keys and values,
-        # so every step gets its own kv cache, like a layer of the unrolled model.
-        self.attn = nn.ModuleList([
-            Attention(
-                self.num_heads,
-                self.head_dim,
-                self.scaling,
-                self.num_kv_heads,
-            )
-            for _ in range(total_ut_steps)
-        ])
+        # One Attention for every loop step: which step's kv cache it reads and writes
+        # is data, set per row by set_depth, not a choice of module.
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            self.num_kv_heads,
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        ut_step: int,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -115,7 +111,7 @@ class OuroAttention(nn.Module):
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         q, k = self.rotary_emb(positions, q, k)
-        o = self.attn[ut_step](q, k, v)
+        o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
 
@@ -160,7 +156,6 @@ class OuroDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            total_ut_steps=config.total_ut_steps,
             max_position=config.max_position_embeddings,
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
@@ -180,11 +175,10 @@ class OuroDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        ut_step: int,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states, ut_step)
+        hidden_states = self.self_attn(positions, hidden_states)
         hidden_states = self.input_layernorm_2.forward_add(hidden_states, residual)
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -204,21 +198,9 @@ class OuroModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([OuroDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # forward runs every loop step and never evaluates this gate; recurrence()
-        # reports its output per step without acting on it.
+        # recurrence() reports this gate's logit after every loop step; nothing acts on
+        # it yet, so every step always runs.
         self.early_exit_gate = ReplicatedLinear(config.hidden_size, 1, bias=True)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        for ut_step in range(self.total_ut_steps):
-            for layer in self.layers:
-                hidden_states = layer(positions, hidden_states, ut_step)
-            hidden_states = self.norm(hidden_states)
-        return hidden_states
 
 
 class OuroForCausalLM(nn.Module):
@@ -239,18 +221,17 @@ class OuroForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
-        # The engine sizes the kv cache from num_hidden_layers and then hands one slot to
-        # each module holding a kv cache, so it has to see the unrolled depth.
-        if not getattr(config, "num_hidden_layers_unrolled", False):
-            config.num_hidden_layers *= config.total_ut_steps
-            config.num_hidden_layers_unrolled = True
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        hidden_states = self.prelude(input_ids)
+        for ut_step in range(self.model.total_ut_steps):
+            depth = torch.full_like(positions, ut_step)
+            hidden_states, _ = self.recurrence(hidden_states, positions, depth)
+        return hidden_states
 
     def compute_logits(
         self,
@@ -258,8 +239,7 @@ class OuroForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
 
-    # forward and compute_logits, split at the loop boundary:
-    # coda(recurrence(prelude(input_ids), positions)[0]) == compute_logits(forward(input_ids, positions))
+    # forward and compute_logits, split at the loop boundary; forward is built from these.
 
     def prelude(
         self,
@@ -271,19 +251,17 @@ class OuroForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
+        depth: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns the final hidden states and the exit gate's logit after every loop
-        step, shaped (num_tokens, total_ut_steps). The gate only reads the hidden
-        states, so the hidden states match forward exactly."""
-        gate_logits = []
-        for ut_step in range(self.model.total_ut_steps):
-            for layer in self.model.layers:
-                hidden_states = layer(positions, hidden_states, ut_step)
-            # The final norm runs inside the loop: its output is both the step's readout
-            # and the next step's input, so it belongs here rather than in the coda.
-            hidden_states = self.model.norm(hidden_states)
-            gate_logits.append(self.model.early_exit_gate(hidden_states))
-        return hidden_states, torch.cat(gate_logits, dim=-1)
+        # Attention is depth blind; set depth configures the KV cache to assign 
+        # depth to each sample
+        set_depth(depth)
+        for layer in self.model.layers:
+            hidden_states = layer(positions, hidden_states)
+        # The norm's output is both this step's readout and the next step's input, so
+        # it belongs to the step rather than to the coda.
+        hidden_states = self.model.norm(hidden_states)
+        return hidden_states, self.model.early_exit_gate(hidden_states)
 
     def coda(
         self,
