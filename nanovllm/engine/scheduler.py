@@ -15,6 +15,8 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.finished: list[Sequence] = []
+        self.preempted: list[Sequence] = []
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -22,11 +24,9 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def schedule_prefill(self) -> list[Sequence]:
         scheduled_seqs = []
         num_batched_tokens = 0
-
-        # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
@@ -41,6 +41,9 @@ class Scheduler:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
                 break
+            completes = remaining >= num_tokens
+            if completes and len(self.running) >= self.max_num_seqs:
+                break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
@@ -50,43 +53,65 @@ class Scheduler:
                 self.waiting.popleft()
                 self.running.append(seq)
             scheduled_seqs.append(seq)
+        return scheduled_seqs
 
-        if scheduled_seqs:
-            return scheduled_seqs, True
+    def postprocess_prefill(self, seqs: list[Sequence], token_ids: list[int]) -> list[Sequence]:
+        continuing = []
+        for seq, token_id in zip(seqs, token_ids):
+            self.block_manager.hash_blocks(seq)
+            seq.num_cached_tokens += seq.num_scheduled_tokens
+            seq.num_scheduled_tokens = 0
+            if seq.num_cached_tokens < seq.num_tokens:
+                continue
+            if self.append(seq, token_id):
+                continuing.append(seq)
+        return continuing
 
-        # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
+    def commit(self, seqs: list[Sequence], token_ids: list[int]) -> list[Sequence]:
+        continuing = []
+        for seq, token_id in zip(seqs, token_ids):
+            seq.num_scheduled_tokens = 1
+            self.block_manager.hash_blocks(seq)
+            seq.num_cached_tokens += 1
+            seq.num_scheduled_tokens = 0
+            if self.append(seq, token_id):
+                continuing.append(seq)
+        return continuing
+
+    def append(self, seq: Sequence, token_id: int) -> bool:
+        seq.append_token(token_id)
+        seq.is_prefill = False
+        if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
+            self.running.remove(seq)
+            self.finished.append(seq)
+            return False
+        return True
+
+    def allocate_slots(self, seqs: list[Sequence]) -> list[Sequence]:
+        for seq in seqs:
+            if seq.status != SequenceStatus.RUNNING:
+                continue
             while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
+                victim = next((other for other in reversed(self.running) if other is not seq), None)
+                if victim is None:
                     self.preempt(seq)
                     break
+                self.preempt(victim)
             else:
-                seq.num_scheduled_tokens = 1
-                seq.is_prefill = False
                 self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        return [seq for seq in seqs if seq.status == SequenceStatus.RUNNING]
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
+        self.running.remove(seq)
         self.waiting.appendleft(seq)
+        self.preempted.append(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
-        for seq, token_id in zip(seqs, token_ids):
-            self.block_manager.hash_blocks(seq)
-            seq.num_cached_tokens += seq.num_scheduled_tokens
-            seq.num_scheduled_tokens = 0
-            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
-                continue
-            seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+    def take_released(self) -> tuple[list[Sequence], list[Sequence]]:
+        finished, preempted = self.finished, self.preempted
+        self.finished, self.preempted = [], []
+        return finished, preempted

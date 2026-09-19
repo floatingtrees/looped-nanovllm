@@ -8,6 +8,7 @@ from nanovllm.config import Config
 from nanovllm.engine.kv_cache import KVCache
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.attention import Attention
+from nanovllm.layers.row_ops import copy_rows, fill_rows
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.ouro import OuroForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -40,13 +41,16 @@ class ModelRunner:
         self.model = MODEL_REGISTRY[hf_config.architectures[0]](hf_config)
         load_model(self.model, config.model)
         self.num_loops = getattr(hf_config, "total_ut_steps", 1)
+        self.exit_policy = config.exit_policy
+        self.exit_threshold = config.exit_threshold
+        self.max_batch_size = config.max_batch_size
+        self.graph_bs = sorted({b for b in [1, 2, 4, 8] + list(range(16, self.max_batch_size + 1, 16)) if b <= self.max_batch_size} | {self.max_batch_size})
         self.kv_cache = None    # allocated after warmup has measured peak activation memory
-        self.depth_buffer = torch.zeros(max(config.max_num_batched_tokens, config.max_num_seqs), dtype=torch.int64)
+        self.allocate_pool()
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
+        self.build_launchers()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -66,7 +70,7 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            del self.graphs, self.graph_pool, self.pass_launch, self.finish_launch, self.write_launch, self.remove_launch
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -100,6 +104,51 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    def allocate_pool(self):
+        hf_config = self.config.hf_config
+        size = self.max_batch_size
+        self.max_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
+        self.n = 0
+        self.row_depth = []
+        self.hidden_states = torch.zeros(size, hf_config.hidden_size)
+        self.positions = torch.zeros(size, dtype=torch.int64)
+        self.kv_slots = torch.full((size,), -1, dtype=torch.int32)
+        self.context_lens = torch.zeros(size, dtype=torch.int32)
+        self.block_tables = torch.zeros(size, self.max_blocks, dtype=torch.int32)
+        self.depth = torch.zeros(size, dtype=torch.int64)
+        self.remaining = torch.ones(size, dtype=torch.float32)
+        self.temperatures = torch.ones(size, dtype=torch.float32)
+        self.exit_mask = torch.zeros(size, dtype=torch.bool)
+        self.exit_rows = torch.zeros(size, dtype=torch.int64)
+        self.exit_count = torch.zeros(1, dtype=torch.int32)
+        self.exit_tokens = torch.zeros(size, dtype=torch.int64)
+        self.coda_input = torch.zeros(size, hf_config.hidden_size)
+        self.write_int = torch.zeros(size, 5 + self.max_blocks, dtype=torch.int64)
+        self.write_float = torch.zeros(size, dtype=torch.float32)
+        self.write_count = torch.zeros(1, dtype=torch.int32)
+        self.move_int = torch.zeros(size, 2, dtype=torch.int64)
+        self.move_count = torch.zeros(1, dtype=torch.int32)
+        self.vacate_rows = torch.zeros(size, dtype=torch.int64)
+        self.vacate_count = torch.zeros(1, dtype=torch.int32)
+        self.lanes = torch.arange(size, dtype=torch.int64)
+        self.prefill_depth = torch.zeros(self.config.max_num_batched_tokens, dtype=torch.int64)
+        self.staging = {
+            name: torch.zeros(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
+            for name, tensor in (
+                ("exit_rows", self.exit_rows), ("exit_count", self.exit_count),
+                ("write_int", self.write_int), ("write_float", self.write_float), ("write_count", self.write_count),
+                ("move_int", self.move_int), ("move_count", self.move_count),
+                ("vacate_rows", self.vacate_rows), ("vacate_count", self.vacate_count),
+            )
+        }
+        self.staging_numpy = {name: tensor.numpy() for name, tensor in self.staging.items()}
+
+    def upload(self, name: str, rows: int):
+        getattr(self, name)[:rows].copy_(self.staging[name][:rows], non_blocking=True)
+
+    def bucket(self, n: int) -> int:
+        return next(b for b in self.graph_bs if b >= n)
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -109,12 +158,7 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        depth = self.run_prelude(seqs, True)
-        for _ in range(self.num_loops):
-            gate_logits = self.run_recurrence(depth)
-            depth += 1
-        self.run_coda()
-        self.has_gate = gate_logits is not None
+        self.prefill(seqs)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -184,135 +228,191 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, self.kv_cache)
         return input_ids, positions
 
-    def prepare_decode(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, kv_cache=self.kv_cache)
-        return input_ids, positions
-
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
     @torch.inference_mode()
-    def run_prelude(self, seqs: list[Sequence], is_prefill: bool) -> torch.Tensor:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        self.temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        self.positions = positions
-        self.num_rows = num_rows = input_ids.size(0)
-        self.graph = None
-        if not (is_prefill or self.enforce_eager or num_rows > 512):
-            context = get_context()
-            self.graph = self.graphs[next(x for x in self.graph_bs if x >= num_rows)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:num_rows] = input_ids
-            graph_vars["positions"][:num_rows] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:num_rows] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:num_rows] = context.context_lens
-            graph_vars["block_tables"][:num_rows, :context.block_tables.size(1)] = context.block_tables
-            self.graph["prelude"].replay()
-            self.hidden_states = graph_vars["hidden_states"][:num_rows]
-        else:
-            self.hidden_states = self.model.prelude(input_ids)
-        return self.depth_buffer[:num_rows].zero_()
-
-    @torch.inference_mode()
-    def run_recurrence(self, depth: torch.Tensor) -> torch.Tensor | None:
-        if self.graph is not None:
-            captured = self.graph_vars["depth"][:self.num_rows]
-            if depth.data_ptr() != captured.data_ptr():
-                captured.copy_(depth)
-            self.graph["recurrence"].replay()
-            return self.graph_vars["gate_logits"][:self.num_rows] if self.has_gate else None
-        self.hidden_states, gate_logits = self.model.recurrence(self.hidden_states, self.positions, depth)
-        return gate_logits.squeeze(-1) if gate_logits is not None else None
-
-    @torch.inference_mode()
-    def run_coda(self) -> list[int] | None:
-        if self.graph is not None and self.graph["coda"] is not None:
-            self.graph["coda"].replay()
-            logits = self.graph_vars["logits"][:self.num_rows]
-        else:
-            logits = self.model.coda(self.hidden_states)
-        token_ids = self.sampler(logits, self.temperatures).tolist() if self.rank == 0 else None
-        self.hidden_states = self.positions = self.temperatures = self.graph = None
+    def prefill(self, seqs: list[Sequence]) -> list[int]:
+        input_ids, positions = self.prepare_prefill(seqs)
+        temperatures = self.prepare_sample(seqs)
+        depth = self.prefill_depth[:input_ids.size(0)]
+        hidden_states = self.model.prelude(input_ids)
+        for ut_step in range(self.num_loops):
+            depth.fill_(ut_step)
+            hidden_states, gate_logits = self.model.recurrence(hidden_states, positions, depth)
+        self.has_gate = gate_logits is not None
+        logits = self.model.coda(hidden_states)
+        token_ids = self.sampler(logits, temperatures).tolist()
         reset_context()
         return token_ids
 
+    def stage_rows(self, rows: list[int], entries: list[tuple]):
+        k = len(rows)
+        write_int, write_float = self.staging_numpy["write_int"], self.staging_numpy["write_float"]
+        for i, (row, (token_id, position, kv_slot, context_len, block_table, temperature)) in enumerate(zip(rows, entries)):
+            write_int[i, :5] = (row, token_id, position, kv_slot, context_len)
+            write_int[i, 5:5 + len(block_table)] = block_table
+            write_float[i] = temperature
+        self.staging_numpy["write_count"][0] = k
+        self.upload("write_int", k)
+        self.upload("write_float", k)
+        self.upload("write_count", 1)
+
     @torch.inference_mode()
-    def capture_cudagraph(self):
-        config = self.config
-        hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        depth = self.depth_buffer[:max_bs]
-        hidden_states = torch.zeros(max_bs, hf_config.hidden_size)
-        gate_logits = torch.zeros(max_bs)
-        logits = torch.zeros(max_bs, hf_config.vocab_size) if self.world_size == 1 else None
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
-        self.graph_pool = None
+    def admit(self, entries: list[tuple]) -> int:
+        start = self.n
+        assert start + len(entries) <= self.max_batch_size
+        rows = list(range(start, start + len(entries)))
+        self.stage_rows(rows, entries)
+        self.write_launch()
+        self.n += len(entries)
+        self.row_depth.extend([0] * len(entries))
+        return start
 
-        def capture(fn):
-            graph = torch.cuda.CUDAGraph()
+    @torch.inference_mode()
+    def restart(self, rows: list[int], entries: list[tuple]):
+        self.stage_rows(rows, entries)
+        self.write_launch()
+        for row in rows:
+            self.row_depth[row] = 0
+
+    @torch.inference_mode()
+    def run_pass(self):
+        self.pass_launch[self.bucket(self.n)]()
+
+    @torch.inference_mode()
+    def exit_rows_after_pass(self) -> list[int]:
+        n = self.n
+        if self.exit_policy != "never" and self.has_gate:
+            exits = self.exit_mask[:n].tolist()
+        else:
+            exits = [depth == self.num_loops - 1 for depth in self.row_depth]
+        rows = []
+        for row, exited in enumerate(exits):
+            if exited:
+                rows.append(row)
+            else:
+                self.row_depth[row] += 1
+        return rows
+
+    @torch.inference_mode()
+    def finish(self, rows: list[int]) -> list[int]:
+        k = len(rows)
+        self.staging_numpy["exit_rows"][:k] = rows
+        self.staging_numpy["exit_count"][0] = k
+        self.upload("exit_rows", k)
+        self.upload("exit_count", 1)
+        self.finish_launch[self.bucket(k)]()
+        return self.exit_tokens[:k].tolist()
+
+    @torch.inference_mode()
+    def remove(self, moves: list[tuple[int, int]], new_n: int):
+        m, old_n = len(moves), self.n
+        vacate = old_n - new_n
+        if moves:
+            self.staging_numpy["move_int"][:m] = moves
+        self.staging_numpy["move_count"][0] = m
+        self.staging_numpy["vacate_rows"][:vacate] = range(new_n, old_n)
+        self.staging_numpy["vacate_count"][0] = vacate
+        self.upload("move_int", m)
+        self.upload("move_count", 1)
+        self.upload("vacate_rows", vacate)
+        self.upload("vacate_count", 1)
+        self.remove_launch()
+        for src, dst in moves:
+            self.row_depth[dst] = self.row_depth[src]
+        del self.row_depth[new_n:]
+        self.n = new_n
+
+    def pass_fn(self, b: int):
+        def run():
+            hidden_states, gate_logits = self.model.recurrence(self.hidden_states[:b], self.positions[:b], self.depth[:b])
+            self.hidden_states[:b] = hidden_states
+            depth = self.depth[:b]
+            last = depth == self.num_loops - 1
+            if self.exit_policy == "threshold" and gate_logits is not None:
+                remaining = self.remaining[:b]
+                remaining.mul_(torch.where(last, 1.0, 1.0 - torch.sigmoid(gate_logits.squeeze(-1).float())))
+                exits = last | (1.0 - remaining >= self.exit_threshold)
+            elif self.exit_policy == "sample" and gate_logits is not None:
+                hazard = torch.sigmoid(gate_logits.squeeze(-1).float())
+                exits = last | (torch.rand_like(hazard) < hazard)
+            else:
+                exits = last
+            self.exit_mask[:b] = exits
+            depth.add_((~exits).to(depth.dtype))
+        context = dict(slot_mapping=self.kv_slots[:b], context_lens=self.context_lens[:b], block_tables=self.block_tables[:b])
+        return run, context
+
+    def finish_fn(self, b: int):
+        def run():
+            rows = self.exit_rows[:b]
+            torch.index_select(self.hidden_states, 0, rows, out=self.coda_input[:b])
+            logits = self.model.coda(self.coda_input[:b])
+            self.exit_tokens[:b] = self.sampler(logits, self.temperatures.index_select(0, rows))
+            if self.exit_policy != "never":
+                self.model.early_exit_protocol(rows, self.exit_count, self.kv_slots, self.depth)
+        return run, {}
+
+    def write_fn(self):
+        size = self.max_batch_size
+        rows, count, lanes = self.write_int[:, 0], self.write_count, self.lanes
+
+        def run():
+            copy_rows(self.positions, self.write_int[:, 2:3], rows, lanes, count, size)
+            copy_rows(self.kv_slots, self.write_int[:, 3:4], rows, lanes, count, size)
+            copy_rows(self.context_lens, self.write_int[:, 4:5], rows, lanes, count, size)
+            copy_rows(self.block_tables, self.write_int[:, 5:], rows, lanes, count, size)
+            copy_rows(self.temperatures, self.write_float, rows, lanes, count, size)
+            fill_rows(self.depth, rows, count, 0, size)
+            fill_rows(self.remaining, rows, count, 1, size)
+            self.model.prelude_into(self.hidden_states, rows, self.write_int[:, 1], count)
+        return run, {}
+
+    def remove_fn(self):
+        size = self.max_batch_size
+        src, dst, count = self.move_int[:, 0], self.move_int[:, 1], self.move_count
+        buffers = (self.hidden_states, self.positions, self.kv_slots, self.context_lens,
+                   self.block_tables, self.depth, self.remaining, self.temperatures)
+
+        def run():
+            for buffer in buffers:
+                copy_rows(buffer, buffer, dst, src, count, size)
+            fill_rows(self.kv_slots, self.vacate_rows, self.vacate_count, -1, size)
+            fill_rows(self.context_lens, self.vacate_rows, self.vacate_count, 0, size)
+        return run, {}
+
+    def launcher(self, fn, context: dict):
+        def eager():
+            set_context(False, kv_cache=self.kv_cache, **context)
             fn()
-            with torch.cuda.graph(graph, self.graph_pool):
-                fn()
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            return graph
-
-        for bs in reversed(self.graph_bs):
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], kv_cache=self.kv_cache)
-
-            def prelude():
-                hidden_states[:bs] = self.model.prelude(input_ids[:bs])
-
-            def recurrence():
-                output, gate = self.model.recurrence(hidden_states[:bs], positions[:bs], depth[:bs])
-                hidden_states[:bs] = output
-                if gate is not None:
-                    gate_logits[:bs] = gate.squeeze(-1)
-
-            def coda():
-                logits[:bs] = self.model.coda(hidden_states[:bs])
-
-            self.graphs[bs] = {
-                "prelude": capture(prelude),
-                "recurrence": capture(recurrence),
-                "coda": capture(coda) if logits is not None else None,
-            }
-            torch.cuda.synchronize()
             reset_context()
+        if self.enforce_eager:
+            return eager
+        set_context(False, kv_cache=self.kv_cache, **context)
+        fn()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, self.graph_pool):
+            fn()
+        if self.graph_pool is None:
+            self.graph_pool = graph.pool()
+        torch.cuda.synchronize()
+        reset_context()
+        self.graphs.append(graph)
+        return graph.replay
 
-        self.graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            depth=depth,
-            hidden_states=hidden_states,
-            gate_logits=gate_logits,
-            logits=logits,
-        )
+    @torch.inference_mode()
+    def build_launchers(self):
+        self.graphs = []
+        self.graph_pool = None
+        self.pass_launch, self.finish_launch = {}, {}
+        for b in reversed(self.graph_bs):
+            self.pass_launch[b] = self.launcher(*self.pass_fn(b))
+            self.finish_launch[b] = self.launcher(*self.finish_fn(b))
+        self.write_launch = self.launcher(*self.write_fn())
+        self.remove_launch = self.launcher(*self.remove_fn())
+        self.depth.zero_()
+        self.remaining.fill_(1)
+        self.exit_mask.zero_()

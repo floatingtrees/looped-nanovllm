@@ -9,6 +9,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.layers.row_ops import copy_rows
 from nanovllm.utils.context import set_depth
 
 
@@ -240,3 +241,21 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def prelude_into(
+        self,
+        hidden_states: torch.Tensor,
+        rows: torch.Tensor,
+        input_ids: torch.Tensor,
+        count: torch.Tensor,
+    ):
+        copy_rows(hidden_states, self.model.embed_tokens.weight, rows, input_ids, count, rows.size(0))
+
+    def early_exit_protocol(
+        self,
+        rows: torch.Tensor,
+        count: torch.Tensor,
+        kv_slots: torch.Tensor,
+        depth: torch.Tensor,
+    ):
+        pass
