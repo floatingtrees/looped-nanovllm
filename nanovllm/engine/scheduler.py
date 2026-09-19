@@ -55,33 +55,36 @@ class Scheduler:
             scheduled_seqs.append(seq)
         return scheduled_seqs
 
-    def postprocess_prefill(self, seqs: list[Sequence], token_ids: list[int]) -> list[Sequence]:
+    def postprocess_prefill(self, seqs: list[Sequence], token_ids: list[int], logprobs: list[float]) -> list[Sequence]:
         continuing = []
-        for seq, token_id in zip(seqs, token_ids):
+        for seq, token_id, logprob in zip(seqs, token_ids, logprobs):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
             if seq.num_cached_tokens < seq.num_tokens:
                 continue
-            if self.append(seq, token_id):
+            if self.append(seq, token_id, -1, logprob):
                 continuing.append(seq)
         return continuing
 
-    def commit(self, seqs: list[Sequence], token_ids: list[int]) -> list[Sequence]:
+    def commit(self, seqs: list[Sequence], token_ids: list[int], depths: list[int], logprobs: list[float]) -> list[Sequence]:
         continuing = []
-        for seq, token_id in zip(seqs, token_ids):
+        for seq, token_id, depth, logprob in zip(seqs, token_ids, depths, logprobs):
             seq.num_scheduled_tokens = 1
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += 1
             seq.num_scheduled_tokens = 0
-            if self.append(seq, token_id):
+            if self.append(seq, token_id, depth, logprob):
                 continuing.append(seq)
         return continuing
 
-    def append(self, seq: Sequence, token_id: int) -> bool:
+    def append(self, seq: Sequence, token_id: int, depth: int, logprob: float) -> bool:
         seq.append_token(token_id)
+        seq.completion_depths.append(depth)
+        seq.completion_logprobs.append(logprob)
         seq.is_prefill = False
-        if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+        if ((not seq.ignore_eos and token_id == self.eos) or token_id in seq.stop_token_ids
+                or seq.num_completion_tokens == seq.max_tokens):
             seq.status = SequenceStatus.FINISHED
             self.block_manager.deallocate(seq)
             self.running.remove(seq)

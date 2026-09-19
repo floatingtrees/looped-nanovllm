@@ -122,6 +122,7 @@ class ModelRunner:
         self.exit_rows = torch.zeros(size, dtype=torch.int64)
         self.exit_count = torch.zeros(1, dtype=torch.int32)
         self.exit_tokens = torch.zeros(size, dtype=torch.int64)
+        self.exit_logprobs = torch.zeros(size, dtype=torch.float32)
         self.coda_input = torch.zeros(size, hf_config.hidden_size)
         self.write_int = torch.zeros(size, 5 + self.max_blocks, dtype=torch.int64)
         self.write_float = torch.zeros(size, dtype=torch.float32)
@@ -234,7 +235,7 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def prefill(self, seqs: list[Sequence]) -> list[int]:
+    def prefill(self, seqs: list[Sequence]) -> tuple[list[int], list[float]]:
         input_ids, positions = self.prepare_prefill(seqs)
         temperatures = self.prepare_sample(seqs)
         depth = self.prefill_depth[:input_ids.size(0)]
@@ -244,9 +245,14 @@ class ModelRunner:
             hidden_states, gate_logits = self.model.recurrence(hidden_states, positions, depth)
         self.has_gate = gate_logits is not None
         logits = self.model.coda(hidden_states)
-        token_ids = self.sampler(logits, temperatures).tolist()
+        token_ids = self.sampler(logits, temperatures)
+        logprobs = self.logprobs(logits, token_ids)
         reset_context()
-        return token_ids
+        return token_ids.tolist(), logprobs.tolist()
+
+    def logprobs(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+        logits = logits.float()
+        return logits.gather(1, token_ids.unsqueeze(1)).squeeze(1) - torch.logsumexp(logits, dim=-1)
 
     def stage_rows(self, rows: list[int], entries: list[tuple]):
         k = len(rows)
@@ -283,29 +289,30 @@ class ModelRunner:
         self.pass_launch[self.bucket(self.n)]()
 
     @torch.inference_mode()
-    def exit_rows_after_pass(self) -> list[int]:
+    def exit_rows_after_pass(self) -> tuple[list[int], list[int]]:
         n = self.n
         if self.exit_policy != "never" and self.has_gate:
             exits = self.exit_mask[:n].tolist()
         else:
             exits = [depth == self.num_loops - 1 for depth in self.row_depth]
-        rows = []
+        rows, depths = [], []
         for row, exited in enumerate(exits):
             if exited:
                 rows.append(row)
+                depths.append(self.row_depth[row])
             else:
                 self.row_depth[row] += 1
-        return rows
+        return rows, depths
 
     @torch.inference_mode()
-    def finish(self, rows: list[int]) -> list[int]:
+    def finish(self, rows: list[int]) -> tuple[list[int], list[float]]:
         k = len(rows)
         self.staging_numpy["exit_rows"][:k] = rows
         self.staging_numpy["exit_count"][0] = k
         self.upload("exit_rows", k)
         self.upload("exit_count", 1)
         self.finish_launch[self.bucket(k)]()
-        return self.exit_tokens[:k].tolist()
+        return self.exit_tokens[:k].tolist(), self.exit_logprobs[:k].tolist()
 
     @torch.inference_mode()
     def remove(self, moves: list[tuple[int, int]], new_n: int):
@@ -351,7 +358,9 @@ class ModelRunner:
             rows = self.exit_rows[:b]
             torch.index_select(self.hidden_states, 0, rows, out=self.coda_input[:b])
             logits = self.model.coda(self.coda_input[:b])
-            self.exit_tokens[:b] = self.sampler(logits, self.temperatures.index_select(0, rows))
+            token_ids = self.sampler(logits, self.temperatures.index_select(0, rows))
+            self.exit_tokens[:b] = token_ids
+            self.exit_logprobs[:b] = self.logprobs(logits, token_ids)
             if self.exit_policy != "never":
                 self.model.early_exit_protocol(rows, self.exit_count, self.kv_slots, self.depth)
         return run, {}

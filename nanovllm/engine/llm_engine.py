@@ -78,8 +78,8 @@ class LLMEngine:
         seqs = self.scheduler.schedule_prefill()
         if seqs:
             num_tokens = sum(seq.num_scheduled_tokens for seq in seqs)
-            token_ids = self.model_runner.call("prefill", seqs)
-            continuing = self.scheduler.allocate_slots(self.scheduler.postprocess_prefill(seqs, token_ids))
+            token_ids, logprobs = self.model_runner.call("prefill", seqs)
+            continuing = self.scheduler.allocate_slots(self.scheduler.postprocess_prefill(seqs, token_ids, logprobs))
             finished = self.release()
             if continuing:
                 start = self.model_runner.call("admit", [self.entry(seq) for seq in continuing])
@@ -89,15 +89,16 @@ class LLMEngine:
         else:
             assert self.rows
             self.model_runner.call("run_pass")
-            exited = self.model_runner.call("exit_rows_after_pass")
+            exited, depths = self.model_runner.call("exit_rows_after_pass")
             num_tokens = -len(exited)
             if exited:
-                token_ids = self.model_runner.call("finish", exited)
-                continuing = self.scheduler.allocate_slots(self.scheduler.commit([self.rows[row] for row in exited], token_ids))
+                token_ids, logprobs = self.model_runner.call("finish", exited)
+                seqs = [self.rows[row] for row in exited]
+                continuing = self.scheduler.allocate_slots(self.scheduler.commit(seqs, token_ids, depths, logprobs))
                 if continuing:
                     self.model_runner.call("restart", [seq.row for seq in continuing], [self.entry(seq) for seq in continuing])
             finished = self.release()
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in finished]
+        outputs = [(seq.seq_id, seq.completion_token_ids, seq.completion_depths, seq.completion_logprobs) for seq in finished]
         return outputs, num_tokens
 
     def is_finished(self):
@@ -127,10 +128,11 @@ class LLMEngine:
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for seq_id, token_ids, depths, logprobs in output:
+                outputs[seq_id] = (token_ids, depths, logprobs)
                 pbar.update(1)
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids, "depths": depths, "logprobs": logprobs}
+                   for token_ids, depths, logprobs in outputs]
         return outputs

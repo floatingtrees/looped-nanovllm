@@ -27,9 +27,12 @@ class Sequence:
         self.is_prefill = True
         self.block_table = []
         self.row = None
+        self.completion_depths = []
+        self.completion_logprobs = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.stop_token_ids = frozenset(sampling_params.stop_token_ids)
 
     def __len__(self):
         return self.num_tokens
